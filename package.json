@@ -1,0 +1,29 @@
+{
+  "name": "server-img",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node dist/index.js",
+    "dev": "ts-node index.ts",
+    "build": "tsc",
+    "clean_windows": "(if exist dist rd /s /q dist) && (if exist node_modules rd /s /q node_modules) && (if exist package-lock.json rd /s /q package-lock.json)",
+    "clean_linux": "rm -rf dist && rm -rf node_modules && rm -rf package-lock.json"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "fs": "^0.0.1-security",
+    "http": "^0.0.1-security",
+    "server-img": "file:"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.21",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "description": "Images server for the project"
+}
