@@ -15,7 +15,10 @@
   "dependencies": {
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.2.1",
+    "file-type": "^21.1.1",
     "fs": "^0.0.1-security",
+    "helmet": "^8.1.0",
     "http": "^0.0.1-security",
     "server-img": "file:"
   },

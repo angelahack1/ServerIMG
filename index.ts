@@ -1,12 +1,16 @@
+
 import express, { Request, Response } from 'express';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import path from 'path';
 import { promises as fs, createReadStream } from 'fs';
+// import FileType from 'file-type'; // Removed static import
 
-const app = express();
+// ---------- Configuration ----------
 const PORT = process.env.PORT || 3000;
 const IMG_CODES_DIR = path.join(process.cwd(), 'images');
-
-const MIME_TYPES: Record<string, string> = {
+const ALLOWED_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico'];
+const ALLOWED_MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -15,112 +19,150 @@ const MIME_TYPES: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+const HEALTH_TOKEN = process.env.HEALTH_TOKEN || 'change-me';
+const HEALTH_IP_WHITELIST = (process.env.HEALTH_IP_WHITELIST || '').split(',').filter(Boolean);
 
-/**
- * Sanitizes a filename to be safe for storage and URL usage.
- * Replicates the functionality of Python's werkzeug.utils.secure_filename.
- * @param filename The filename to sanitize.
- * @returns A sanitized filename.
- */
-const secureFilename = (filename: string): string => {
-    // Normalize to NFD Unicode form to separate accents from letters,
-    // then remove the accent characters.
-    const withoutAccents = filename.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+// ---------- Simple logger ----------
+enum LogLevel {
+  INFO = 'INFO',
+  WARN = 'WARN',
+  ERROR = 'ERROR',
+}
+function log(level: LogLevel, message: string, meta?: unknown) {
+  const ts = new Date().toISOString();
+  if (meta) {
+    console.log(`[${ts}] ${level}: ${message}`, meta);
+  } else {
+    console.log(`[${ts}] ${level}: ${message}`);
+  }
+}
 
-    // Replace whitespace with underscores and remove characters that are not
-    // alphanumeric, underscores, hyphens, or dots.
-    const sanitized = withoutAccents
-        .replace(/\s+/g, '_')
-        .replace(/[^a-zA-Z0-9._-]/g, '');
+// ---------- Security middlewares ----------
+const app = express();
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
-    // Remove leading/trailing separators and ensure it's not just a dot.
-    const final = sanitized.replace(/^[._-]+|[._-]+$/g, '');
+app.use(limiter);
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        imgSrc: ["'self'"],
+        scriptSrc: ["'none'"],
+        styleSrc: ["'none'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'none'"],
+      },
+    },
+    // other helmet defaults (XSS‑Protection, HSTS, etc.) are kept
+  })
+);
 
-    if (final === '.' || final === '..') {
-        return '';
+// ---------- Helper: safe filename ----------
+function getSafeFilePath(unsafeName: string): string | null {
+  // Remove any path separators and normalize
+  const sanitized = unsafeName.replace(/[\\\/]+/g, '');
+  const ext = path.extname(sanitized).toLowerCase();
+
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    return null;
+  }
+
+  // Resolve against the base directory and ensure it stays inside
+  const resolved = path.resolve(IMG_CODES_DIR, sanitized);
+  if (!resolved.startsWith(IMG_CODES_DIR + path.sep)) {
+    return null;
+  }
+  return resolved;
+}
+
+// ---------- Middleware: MIME validation ----------
+async function validateMime(filePath: string, expectedExt: string): Promise<boolean> {
+  try {
+    // Dynamic import for ESM compatibility
+    const { fileTypeFromFile } = await import('file-type');
+    const type = await fileTypeFromFile(filePath);
+    if (!type) {
+      return false;
     }
+    const expectedMime = ALLOWED_MIME[expectedExt];
+    return type.mime === expectedMime;
+  } catch (err) {
+    log(LogLevel.WARN, 'MIME validation error', { filePath, error: err });
+    return false;
+  }
+}
 
-    return final;
-};
+// ---------- Health‑check endpoint ----------
+app.get('/', (req: Request, res: Response) => {
+  // Token‑based protection (preferred)
+  const token = req.query.token as string | undefined;
+  if (HEALTH_TOKEN && token !== HEALTH_TOKEN) {
+    // Optional IP whitelist fallback
+    const clientIp = req.ip || '';
+    if (!HEALTH_IP_WHITELIST.includes(clientIp)) {
+      res.status(403).send('Forbidden');
+      return;
+    }
+  }
+  res.send('OK');
+});
 
-// Middleware to parse JSON requests - useful for potential future API endpoints
-app.use(express.json());
-
-// Serve static files from images directory
-app.get('/:filename', async (req: Request, res: Response) => {
-  const unsafeFilename = req.params.filename;
-  const filename = secureFilename(unsafeFilename);
-
-  if (!filename) {
+// ---------- Serve images ----------
+app.get('/img/:filename', async (req: Request, res: Response) => {
+  const unsafeName = req.params.filename;
+  const safePath = getSafeFilePath(unsafeName);
+  if (!safePath) {
+    log(LogLevel.WARN, 'Invalid filename request', { unsafeName });
     res.status(400).send('Invalid filename');
     return;
   }
 
-  const imagePath = path.join(IMG_CODES_DIR, filename);
+  const ext = path.extname(safePath).toLowerCase();
 
+  // Verify the file exists
   try {
-    const stats = await fs.stat(imagePath);
+    await fs.access(safePath);
+  } catch {
+    log(LogLevel.WARN, 'File not found', { safePath });
+    res.status(404).send('Image not found');
+    return;
+  }
 
-    if (!stats.isFile()) {
-      res.status(404).send('Image not found');
-      return;
-    }
+  // MIME type validation against actual content
+  const mimeOk = await validateMime(safePath, ext);
+  if (!mimeOk) {
+    log(LogLevel.WARN, 'MIME mismatch', { safePath, ext });
+    res.status(415).send('Unsupported Media Type');
+    return;
+  }
 
-    const ext = path.extname(filename).toLowerCase();
-    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-    
-    const fileStream = createReadStream(imagePath);
-    fileStream.pipe(res);
-
-    fileStream.on('error', (error) => {
-        console.error('Stream error:', error);
-        if (!res.headersSent) {
-            res.status(500).send('Internal Server Error');
-        }
-    });
-
-  } catch (error: any) {
-    if (error.code === 'ENOENT') {
-      res.status(404).send('Image not found');
-    } else {
-      console.error(`Error serving ${filename}:`, error);
+  // Stream the file
+  const stream = createReadStream(safePath);
+  stream.on('open', () => {
+    res.setHeader('Content-Type', ALLOWED_MIME[ext]);
+    stream.pipe(res);
+  });
+  stream.on('error', (err) => {
+    log(LogLevel.ERROR, 'Stream error', err);
+    if (!res.headersSent) {
       res.status(500).send('Internal Server Error');
     }
-  }
+  });
 });
 
-// Health check and file list endpoint
-app.get('/', async (req: Request, res: Response) => {
-  try {
-    const files = await fs.readdir(IMG_CODES_DIR);
-    const imageFiles = files.filter(file => 
-        Object.keys(MIME_TYPES).includes(path.extname(file).toLowerCase())
-    );
-
-    res.json({ 
-      message: 'Images Server is running',
-      availableImages: imageFiles,
-      usage: 'GET /{filename} to retrieve an image.'
-    });
-  } catch (error) {
-    console.error("Could not read images directory:", error);
-    res.status(500).json({
-        message: 'Image Server is running, but could not read image directory.',
-        error: 'Could not list available images.'
-    });
-  }
+// ---------- Fallback for unknown routes ----------
+app.use((_req, res) => {
+  res.status(404).send('Not found');
 });
 
-// Start the server only if not in a test environment
-if (process.env.NODE_ENV !== 'test') {
-    app.listen(PORT, () => {
-        console.log(`Server-img v1.0.0 is running on http://localhost:${PORT}`);
-        console.log(`Images are served from the '${IMG_CODES_DIR}' directory`);
-    });
-}
-
-export default app;
-
+// ---------- Start server ----------
+app.listen(PORT, () => {
+  // Note: TLS termination should be performed by an upstream proxy/ingress.
+  log(LogLevel.INFO, `Server listening on port ${PORT}`);
+});
